@@ -120,14 +120,16 @@ function compileSingleFileToAST(
 }
 
 /**
- * Phase 2: Parallel compilation with parallel rendering and I/O
+ * Phase 2: Optimized compilation with batched operations
  *
- * This version maintains the same input/output interface as the original
- * but adds parallel rendering of ASTs for better performance.
+ * This version optimizes the compilation pipeline by:
+ * 1. Sequential AST transformation (CPU-bound, can't be parallelized without Worker Threads)
+ * 2. Batched rendering (prepares for parallel I/O)
+ * 3. Parallel file writing (I/O-bound, can be parallelized)
  *
- * Performance improvement: 20-40% expected
+ * Performance improvement: Mainly from parallel I/O operations
  */
-export async function compileFilesParallelPhase2(
+export function compileFilesParallelPhase2(
 	program: ts.Program,
 	data: ProjectData,
 	pathTranslator: PathTranslator,
@@ -139,7 +141,7 @@ export async function compileFilesParallelPhase2(
 	nodeModulesPathMapping: Map<string, string>,
 	runtimeLibRbxPath: any,
 	projectType: any,
-): Promise<CompileResult[]> {
+): CompileResult[] {
 	const typeChecker = program.getTypeChecker();
 	const services = createTransformServices(typeChecker);
 	const progressMaxLength = `${sourceFiles.length}/${sourceFiles.length}`.length;
@@ -179,8 +181,10 @@ export async function compileFilesParallelPhase2(
 		}
 	}
 
-	// Step 2: Parallel rendering of ASTs ⚡ NEW!
-	const renderTasks = astResults.map(async astResult => {
+	// Step 2: Render ASTs (synchronous, but batched)
+	// Note: renderAST is CPU-bound and synchronous, so we can't truly parallelize it
+	// without Worker Threads. However, we batch the results for parallel I/O later.
+	const renderResults: CompileResult[] = astResults.map(astResult => {
 		if (astResult.luauAST === null) {
 			return {
 				sourceFile: astResult.sourceFile,
@@ -189,8 +193,8 @@ export async function compileFilesParallelPhase2(
 			};
 		}
 
-		// Render AST to Lua source in parallel
-		const source = await Promise.resolve(renderAST(astResult.luauAST));
+		// Render AST to Lua source (synchronous)
+		const source = renderAST(astResult.luauAST);
 
 		return {
 			sourceFile: astResult.sourceFile,
@@ -199,15 +203,13 @@ export async function compileFilesParallelPhase2(
 		};
 	});
 
-	const renderResults = await Promise.all(renderTasks);
-
-	return renderResults as CompileResult[];
+	return renderResults;
 }
 
 /**
  * Original implementation (Phase 1) - kept for compatibility
  */
-export async function compileFilesParallel(
+export function compileFilesParallel(
 	program: ts.Program,
 	data: ProjectData,
 	pathTranslator: PathTranslator,
@@ -219,7 +221,7 @@ export async function compileFilesParallel(
 	nodeModulesPathMapping: Map<string, string>,
 	runtimeLibRbxPath: any,
 	projectType: any,
-): Promise<CompileResult[]> {
+): CompileResult[] {
 	// Use Phase 2 implementation by default
 	return compileFilesParallelPhase2(
 		program,

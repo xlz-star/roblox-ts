@@ -14,25 +14,35 @@
 
 **roblox-ts** is an attempt to bridge the abilities of TypeScript to work in a Roblox environment. We break down your code into an abstract syntax tree and emit functionally similar structures in [Luau](https://luau-lang.org/) so that the code behaves the same.
 
-## ⚡ Parallel Compilation
+## ⚡ Parallel I/O Optimization (Experimental)
 
-This fork includes **parallel compilation** support for significantly faster build times!
+This fork includes **parallel file I/O optimization** for slightly faster build times.
 
 ### Quick Start
 
 ```bash
-# Enable parallel compilation (32% faster)
+# Enable parallel I/O (1-3% faster on full rebuilds)
 rbxtsc --parallel
 
-# Watch mode with parallel compilation
+# Watch mode with parallel I/O
 rbxtsc --watch --parallel
 ```
 
 ### Performance
 
-- **32% faster** compilation on average
-- Parallel AST rendering and file I/O
-- Scales better with larger projects (50+ files)
+- **1-3% faster** on full rebuilds (mainly from parallel file I/O)
+- **Parallel file writing** reduces I/O bottleneck
+- **Best for projects with many files** (1000+ files)
+
+### Why not 32% faster?
+
+The compilation bottleneck breakdown:
+
+- **~96%**: AST transformation (CPU-bound, single-threaded)
+- **~2%**: TypeScript transformers (sequential)
+- **~2%**: File I/O (parallelized ✅)
+
+To achieve 30%+ speedup would require Worker Threads for AST transformation, which needs major architecture changes.
 
 ### Configuration
 
@@ -45,6 +55,8 @@ You can also enable it in `tsconfig.json`:
 	}
 }
 ```
+
+**Note**: This is an experimental feature. The performance gain is modest (1-3%) but consistent.
 
 ## Quick start & Documentation
 

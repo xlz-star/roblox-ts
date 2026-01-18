@@ -4,11 +4,15 @@ import { RojoResolver } from "@roblox-ts/rojo-resolver";
 import fs from "fs-extra";
 import path from "path";
 import { compileFilesParallelPhase2 } from "Project/functions/compileFilesParallelPhase2";
+import { createTransformerList, flattenIntoTransformers } from "Project/transformers/createTransformerList";
+import { createTransformerWatcher } from "Project/transformers/createTransformerWatcher";
+import { getPluginConfigs } from "Project/transformers/getPluginConfigs";
 import { ProjectData } from "Shared/types";
 import { benchmarkIfVerbose } from "Shared/util/benchmark";
 import { MultiTransformState } from "TSTransformer";
 import { DiagnosticService } from "TSTransformer/classes/DiagnosticService";
 import ts from "typescript";
+import { assert } from "Shared/util/assert";
 
 /**
  * Phase 2: Complete parallel compilation with parallel I/O
@@ -31,12 +35,65 @@ export async function compileAndWriteFilesParallel(
 ): Promise<ts.EmitResult> {
 	const startTime = Date.now();
 
-	// Step 1 & 2: Transform and parallel render
-	const results = await compileFilesParallelPhase2(
-		program,
+	// Step 0: Apply TypeScript custom transformers (like rbxts-transform-env)
+	let proxyProgram = program;
+	let transformedSourceFiles = sourceFiles;
+
+	if (compilerOptions.plugins && compilerOptions.plugins.length > 0) {
+		benchmarkIfVerbose(`running transformers..`, () => {
+			const pluginConfigs = getPluginConfigs(data.tsConfigPath);
+			const transformerList = createTransformerList(program, pluginConfigs, data.projectPath);
+			const transformers = flattenIntoTransformers(transformerList);
+			if (transformers.length > 0) {
+				const { service, updateFile } = (data.transformerWatcher ??= createTransformerWatcher(program));
+				const transformResult = ts.transformNodes(
+					undefined,
+					undefined,
+					ts.factory,
+					compilerOptions,
+					sourceFiles,
+					transformers,
+					false,
+				);
+
+				if (transformResult.diagnostics) DiagnosticService.addDiagnostics(transformResult.diagnostics);
+
+				const newSourceFiles: ts.SourceFile[] = [];
+				for (const sourceFile of transformResult.transformed) {
+					if (ts.isSourceFile(sourceFile)) {
+						// transformed nodes don't have symbol or type information (or they have out of date information)
+						// there's no way to "rebind" an existing file, so we have to reprint it
+						const source = ts.createPrinter().printFile(sourceFile);
+						updateFile(sourceFile.fileName, source);
+						if (data.projectOptions.writeTransformedFiles) {
+							const outPath = pathTranslator.getOutputTransformedPath(sourceFile.fileName);
+							fs.outputFileSync(outPath, source);
+						}
+						newSourceFiles.push(sourceFile);
+					}
+				}
+
+				proxyProgram = service.getProgram()!;
+				// Update source files to use the transformed versions
+				transformedSourceFiles = newSourceFiles.map(sf => {
+					const updated = proxyProgram.getSourceFile(sf.fileName);
+					assert(updated);
+					return updated;
+				});
+			}
+		});
+	}
+
+	if (DiagnosticService.hasErrors()) {
+		return { emitSkipped: true, diagnostics: DiagnosticService.flush() };
+	}
+
+	// Step 1 & 2: Transform and render (synchronous, but batched for parallel I/O)
+	const results = compileFilesParallelPhase2(
+		proxyProgram,
 		data,
 		pathTranslator,
-		sourceFiles,
+		transformedSourceFiles,
 		multiTransformState,
 		compilerOptions,
 		rojoResolver,
@@ -62,27 +119,39 @@ export async function compileAndWriteFilesParallel(
 		};
 	}
 
-	// Step 3: Parallel file writing ⚡ NEW!
-	const writeTasks = results.map(async (result: any) => {
-		if (result.source) {
-			const outPath = pathTranslator.getOutputPath(result.sourceFile.fileName);
+	// Step 3: Parallel file writing with batching ⚡ TRUE PARALLELISM!
+	// Write files in batches to avoid overwhelming the file system
+	const BATCH_SIZE = 50; // Write 50 files at a time
+	const batches: Array<Array<any>> = [];
 
-			// Check if we need to write (skip if content is the same)
-			const shouldWrite =
-				!data.projectOptions.writeOnlyChanged ||
-				!(await fs.pathExists(outPath)) ||
-				(await fs.readFile(outPath, "utf8")) !== result.source;
+	for (let i = 0; i < results.length; i += BATCH_SIZE) {
+		batches.push(results.slice(i, i + BATCH_SIZE));
+	}
 
-			if (shouldWrite) {
-				await fs.outputFile(outPath, result.source);
-				return outPath;
+	const emittedFiles: string[] = [];
+
+	for (const batch of batches) {
+		const writeTasks = batch.map(async (result: any) => {
+			if (result.source) {
+				const outPath = pathTranslator.getOutputPath(result.sourceFile.fileName);
+
+				// Check if we need to write (skip if content is the same)
+				const shouldWrite =
+					!data.projectOptions.writeOnlyChanged ||
+					!(await fs.pathExists(outPath)) ||
+					(await fs.readFile(outPath, "utf8")) !== result.source;
+
+				if (shouldWrite) {
+					await fs.outputFile(outPath, result.source);
+					return outPath;
+				}
 			}
-		}
-		return null;
-	});
+			return null;
+		});
 
-	const written = await Promise.all(writeTasks);
-	const emittedFiles = written.filter((p): p is string => p !== null);
+		const written = await Promise.all(writeTasks);
+		emittedFiles.push(...written.filter((p): p is string => p !== null));
+	}
 
 	const endTime = Date.now();
 	const totalTime = endTime - startTime;
