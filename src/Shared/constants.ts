@@ -39,7 +39,7 @@ export enum ProjectType {
 }
 
 export const DEFAULT_PROJECT_OPTIONS: ProjectOptions = {
-	includePath: "",
+	includePath: "include",
 	rojo: undefined,
 	type: undefined,
 	watch: false,
@@ -52,4 +52,5 @@ export const DEFAULT_PROJECT_OPTIONS: ProjectOptions = {
 	optimizedLoops: true,
 	allowCommentDirectives: false,
 	luau: true,
+	parallel: false, // Phase 2 parallel compilation disabled by default
 };

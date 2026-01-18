@@ -1,10 +1,13 @@
 import { PathTranslator } from "@roblox-ts/path-translator";
+import { RojoResolver } from "@roblox-ts/rojo-resolver";
 import chokidar, { ChokidarOptions } from "chokidar";
 import fs from "fs-extra";
 import { ProjectData } from "Project";
 import { checkFileName } from "Project/functions/checkFileName";
 import { cleanup } from "Project/functions/cleanup";
 import { compileFiles } from "Project/functions/compileFiles";
+import { compileAndWriteFilesParallel } from "Project/functions/compileAndWriteFilesParallel";
+import { createNodeModulesPathMapping } from "Project/functions/createNodeModulesPathMapping";
 import { copyFiles } from "Project/functions/copyFiles";
 import { copyInclude } from "Project/functions/copyInclude";
 import { copyItem } from "Project/functions/copyItem";
@@ -17,8 +20,10 @@ import { isCompilableFile } from "Project/util/isCompilableFile";
 import { walkDirectorySync } from "Project/util/walkDirectorySync";
 import { DTS_EXT } from "Shared/constants";
 import { DiagnosticError } from "Shared/errors/DiagnosticError";
+import { LogService } from "Shared/classes/LogService";
 import { assert } from "Shared/util/assert";
 import { getRootDirs } from "Shared/util/getRootDirs";
+import { MultiTransformState } from "TSTransformer";
 import ts from "typescript";
 
 const CHOKIDAR_OPTIONS: ChokidarOptions = {
@@ -33,7 +38,7 @@ function fixSlashes(fsPath: string) {
 	return fsPath.replace(/\\/g, "/");
 }
 
-export function setupProjectWatchProgram(data: ProjectData, usePolling: boolean) {
+export function setupProjectWatchProgram(data: ProjectData, usePolling: boolean, useParallel?: boolean) {
 	const { fileNames, options } = getParsedCommandLine(data);
 	const fileNamesSet = new Set(fileNames);
 
@@ -77,14 +82,41 @@ export function setupProjectWatchProgram(data: ProjectData, usePolling: boolean)
 		pathTranslator = createPathTranslator(program, data);
 	}
 
-	function runInitialCompile() {
+	async function runInitialCompile() {
 		refreshProgram();
 		assert(program && pathTranslator);
 		cleanup(pathTranslator);
 		copyInclude(data);
 		copyFiles(data, pathTranslator, new Set(getRootDirs(options)));
 		const sourceFiles = getChangedSourceFiles(program);
-		const emitResult = compileFiles(program.getProgram(), data, pathTranslator, sourceFiles);
+
+		let emitResult: ts.EmitResult;
+		if (useParallel) {
+			LogService.writeLineIfVerbose("⚡ Watch mode: Using parallel compilation");
+			const multiTransformState = new MultiTransformState();
+			const rojoResolver = data.rojoConfigPath
+				? RojoResolver.fromPath(data.rojoConfigPath)
+				: RojoResolver.synthetic(options.outDir!);
+			const pkgRojoResolvers = options.typeRoots!.map(RojoResolver.synthetic);
+			const nodeModulesPathMapping = createNodeModulesPathMapping(options.typeRoots!);
+
+			emitResult = await compileAndWriteFilesParallel(
+				program.getProgram(),
+				data,
+				pathTranslator,
+				sourceFiles,
+				multiTransformState,
+				options,
+				rojoResolver,
+				pkgRojoResolvers,
+				nodeModulesPathMapping,
+				undefined,
+				data.projectOptions.type || ("package" as any),
+			);
+		} else {
+			emitResult = compileFiles(program.getProgram(), data, pathTranslator, sourceFiles);
+		}
+
 		if (!emitResult.emitSkipped) {
 			initialCompileCompleted = true;
 		}
@@ -94,7 +126,11 @@ export function setupProjectWatchProgram(data: ProjectData, usePolling: boolean)
 	const filesToCompile = new Set<string>();
 	const filesToCopy = new Set<string>();
 	const filesToClean = new Set<string>();
-	function runIncrementalCompile(additions: Set<string>, changes: Set<string>, removals: Set<string>): ts.EmitResult {
+	async function runIncrementalCompile(
+		additions: Set<string>,
+		changes: Set<string>,
+		removals: Set<string>,
+	): Promise<ts.EmitResult> {
 		for (const fsPath of additions) {
 			if (fs.statSync(fsPath).isDirectory()) {
 				walkDirectorySync(fsPath, item => {
@@ -142,8 +178,36 @@ export function setupProjectWatchProgram(data: ProjectData, usePolling: boolean)
 
 		refreshProgram();
 		assert(program && pathTranslator);
-		const sourceFiles = getChangedSourceFiles(program, options.incremental ? undefined : [...filesToCompile]);
-		const emitResult = compileFiles(program.getProgram(), data, pathTranslator, sourceFiles);
+
+		const sourceFiles = [...filesToCompile]
+			.map(v => program!.getProgram().getSourceFile(v))
+			.filter((v): v is ts.SourceFile => v !== undefined);
+
+		let emitResult: ts.EmitResult;
+		if (useParallel) {
+			const multiTransformState = new MultiTransformState();
+			const rojoResolver = data.rojoConfigPath
+				? RojoResolver.fromPath(data.rojoConfigPath)
+				: RojoResolver.synthetic(options.outDir!);
+			const pkgRojoResolvers = options.typeRoots!.map(RojoResolver.synthetic);
+			const nodeModulesPathMapping = createNodeModulesPathMapping(options.typeRoots!);
+
+			emitResult = await compileAndWriteFilesParallel(
+				program.getProgram(),
+				data,
+				pathTranslator,
+				sourceFiles,
+				multiTransformState,
+				options,
+				rojoResolver,
+				pkgRojoResolvers,
+				nodeModulesPathMapping,
+				undefined,
+				data.projectOptions.type || ("package" as any),
+			);
+		} else {
+			emitResult = compileFiles(program.getProgram(), data, pathTranslator, sourceFiles);
+		}
 		if (emitResult.emitSkipped) {
 			// exit before copying to prevent half-updated out directory
 			return emitResult;
@@ -166,10 +230,10 @@ export function setupProjectWatchProgram(data: ProjectData, usePolling: boolean)
 		return emitResult;
 	}
 
-	function runCompile() {
+	async function runCompile() {
 		try {
 			if (!initialCompileCompleted) {
-				return runInitialCompile();
+				return await runInitialCompile();
 			} else {
 				const additions = filesToAdd;
 				const changes = filesToChange;
@@ -177,7 +241,7 @@ export function setupProjectWatchProgram(data: ProjectData, usePolling: boolean)
 				filesToAdd = new Set();
 				filesToChange = new Set();
 				filesToDelete = new Set();
-				return runIncrementalCompile(additions, changes, removals);
+				return await runIncrementalCompile(additions, changes, removals);
 			}
 		} catch (e) {
 			if (e instanceof DiagnosticError) {
@@ -191,9 +255,9 @@ export function setupProjectWatchProgram(data: ProjectData, usePolling: boolean)
 		}
 	}
 
-	function closeEventCollection() {
+	async function closeEventCollection() {
 		collecting = false;
-		reportEmitResult(runCompile());
+		reportEmitResult(await runCompile());
 	}
 
 	function openEventCollection() {
@@ -228,8 +292,8 @@ export function setupProjectWatchProgram(data: ProjectData, usePolling: boolean)
 		.on("change", collectChangeEvent)
 		.on("unlink", collectDeleteEvent)
 		.on("unlinkDir", collectDeleteEvent)
-		.once("ready", () => {
+		.once("ready", async () => {
 			reportText("Starting compilation in watch mode...");
-			reportEmitResult(runCompile());
+			reportEmitResult(await runCompile());
 		});
 }
